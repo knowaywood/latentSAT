@@ -30,6 +30,7 @@ class RLSample:
 class RolloutBatch:
     texts: list[str]
     token_ids: Tensor
+    sequence_lengths: list[int]
     token_log_probs: Tensor
     token_mask: Tensor
     rewards: Tensor
@@ -102,15 +103,27 @@ class PolicyGradientTrainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device)
+        self._freeze_for_rl()
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            [param for param in self.model.parameters() if param.requires_grad],
             lr=lr,
             weight_decay=weight_decay,
         )
         self.baseline = RunningMeanBaseline()
 
-    def _decode_texts(self, token_ids: Tensor) -> list[str]:
-        return self.model.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
+    def _freeze_for_rl(self) -> None:
+        for param in self.model.llm.parameters():
+            param.requires_grad = False
+        for module in (self.model.cnf_adapter, self.model.dual_track):
+            for param in module.parameters():
+                param.requires_grad = True
+
+    def _decode_texts(self, token_ids: Tensor, sequence_lengths: Sequence[int]) -> list[str]:
+        trimmed = [
+            token_ids[i, : sequence_lengths[i]].detach().cpu().tolist()
+            for i in range(token_ids.size(0))
+        ]
+        return self.model.tokenizer.batch_decode(trimmed, skip_special_tokens=True)
 
     def _compute_reward(self, clauses: list[list[int]], satisfiable: bool, text: str) -> float:
         text = text.strip()
@@ -155,6 +168,7 @@ class PolicyGradientTrainer:
 
         batch_size = len(batch)
         generated_ids = torch.empty(batch_size, 0, dtype=torch.long, device=self.device)
+        sequence_lengths = [self.max_new_tokens] * batch_size
         token_log_probs: list[Tensor] = []
         token_mask: list[Tensor] = []
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
@@ -181,6 +195,9 @@ class PolicyGradientTrainer:
 
             if self.model.tokenizer.eos_token_id is not None:
                 eos_mask = next_token.squeeze(1) == self.model.tokenizer.eos_token_id
+                newly_finished = eos_mask & (~finished)
+                for idx in torch.nonzero(newly_finished, as_tuple=False).flatten().tolist():
+                    sequence_lengths[idx] = len(token_log_probs)
                 finished = finished | eos_mask
 
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -197,7 +214,11 @@ class PolicyGradientTrainer:
             if bool(finished.all()):
                 break
 
-        texts = self._decode_texts(generated_ids)
+        for i, is_finished in enumerate(finished.tolist()):
+            if not is_finished:
+                sequence_lengths[i] = generated_ids.size(1)
+
+        texts = self._decode_texts(generated_ids, sequence_lengths)
         rewards = torch.tensor(
             [
                 self._compute_reward(sample.clauses, sample.satisfiable, text)
@@ -209,6 +230,7 @@ class PolicyGradientTrainer:
         return RolloutBatch(
             texts=texts,
             token_ids=generated_ids,
+            sequence_lengths=sequence_lengths,
             token_log_probs=torch.stack(token_log_probs, dim=1),
             token_mask=torch.stack(token_mask, dim=1),
             rewards=rewards,

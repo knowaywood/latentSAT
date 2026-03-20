@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -57,51 +58,17 @@ class ResidualMLP(nn.Module):
         return self.dropout(y)
 
 
-class CNFAdapter(nn.Module):
-    """Encode variable-length CNF clauses into a fixed number of prefix tokens."""
+class CNFTextAdapter(nn.Module):
+    """Compress CNF text embeddings into a fixed number of prefix tokens."""
 
     def __init__(
         self,
         hidden_size: int,
         prefix_tokens: int,
-        clause_hidden_dim: int,
         adapter_heads: int,
-        adapter_layers: int,
         dropout: float,
-        max_variables: int = 512,
-        max_clause_length: int = 16,
-        max_clause_count: int = 512,
     ) -> None:
         super().__init__()
-        self.clause_hidden_dim = clause_hidden_dim
-        self.max_variables = max_variables
-        self.max_clause_length = max_clause_length
-        self.max_clause_count = max_clause_count
-
-        self.variable_embedding = nn.Embedding(max_variables + 1, clause_hidden_dim)
-        self.sign_embedding = nn.Embedding(3, clause_hidden_dim)
-        self.literal_position_embedding = nn.Embedding(
-            max_clause_length, clause_hidden_dim
-        )
-        self.clause_position_embedding = nn.Embedding(
-            max_clause_count, clause_hidden_dim
-        )
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=clause_hidden_dim,
-            nhead=adapter_heads,
-            dim_feedforward=clause_hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.clause_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=adapter_layers
-        )
-        self.to_hidden = nn.Sequential(
-            nn.LayerNorm(clause_hidden_dim),
-            nn.Linear(clause_hidden_dim, hidden_size),
-        )
         self.prefix_queries = nn.Parameter(torch.randn(prefix_tokens, hidden_size))
         self.prefix_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
@@ -111,79 +78,13 @@ class CNFAdapter(nn.Module):
         )
         self.prefix_norm = nn.LayerNorm(hidden_size)
 
-    def _empty_clause_state(self, device: torch.device) -> Tensor:
-        return torch.zeros(1, self.clause_hidden_dim, device=device)
-
-    def _encode_single_cnf(self, clauses: Sequence[Sequence[int]]) -> Tensor:
-        device = self.prefix_queries.device
-        if not clauses:
-            return self._empty_clause_state(device)
-
-        clause_vectors = []
-        for clause_idx, clause in enumerate(clauses[: self.max_clause_count]):
-            if not clause:
-                continue
-
-            vars_idx = []
-            sign_idx = []
-            pos_idx = []
-            for lit_pos, literal in enumerate(clause[: self.max_clause_length]):
-                vars_idx.append(min(abs(int(literal)), self.max_variables))
-                sign_idx.append(1 if literal > 0 else 2)
-                pos_idx.append(lit_pos)
-
-            var_tensor = torch.tensor(vars_idx, dtype=torch.long, device=device)
-            sign_tensor = torch.tensor(sign_idx, dtype=torch.long, device=device)
-            pos_tensor = torch.tensor(pos_idx, dtype=torch.long, device=device)
-            clause_pos_tensor = torch.full_like(
-                pos_tensor, fill_value=min(clause_idx, self.max_clause_count - 1)
-            )
-
-            literal_states = (
-                self.variable_embedding(var_tensor)
-                + self.sign_embedding(sign_tensor)
-                + self.literal_position_embedding(pos_tensor)
-                + self.clause_position_embedding(clause_pos_tensor)
-            )
-            clause_vectors.append(literal_states.mean(dim=0))
-
-        if not clause_vectors:
-            return self._empty_clause_state(device)
-
-        clause_tensor = torch.stack(clause_vectors, dim=0).unsqueeze(0)
-        encoded = self.clause_encoder(clause_tensor)
-        return encoded.squeeze(0)
-
-    def forward(self, batch_clauses: Sequence[Sequence[Sequence[int]]]) -> Tensor:
-        if not batch_clauses:
-            raise ValueError("batch_clauses cannot be empty")
-
-        batch_clause_states = [
-            self._encode_single_cnf(clauses) for clauses in batch_clauses
-        ]
-        max_clauses = max(state.size(0) for state in batch_clause_states)
-        clause_dim = batch_clause_states[0].size(-1)
-        device = batch_clause_states[0].device
-
-        padded = torch.zeros(
-            len(batch_clause_states), max_clauses, clause_dim, device=device
-        )
-        key_padding_mask = torch.ones(
-            len(batch_clause_states), max_clauses, device=device, dtype=torch.bool
-        )
-        for i, state in enumerate(batch_clause_states):
-            padded[i, : state.size(0)] = state
-            key_padding_mask[i, : state.size(0)] = False
-
-        clause_hidden = self.to_hidden(padded)
-        queries = self.prefix_queries.unsqueeze(0).expand(
-            len(batch_clause_states), -1, -1
-        )
+    def forward(self, cnf_embeds: Tensor, cnf_attention_mask: Tensor) -> Tensor:
+        queries = self.prefix_queries.unsqueeze(0).expand(cnf_embeds.size(0), -1, -1)
         prefix, _ = self.prefix_attention(
             query=queries,
-            key=clause_hidden,
-            value=clause_hidden,
-            key_padding_mask=key_padding_mask,
+            key=cnf_embeds,
+            value=cnf_embeds,
+            key_padding_mask=cnf_attention_mask == 0,
             need_weights=False,
         )
         return self.prefix_norm(prefix + queries)
@@ -242,16 +143,11 @@ class LatentSATModel(nn.Module):
             for param in self.llm.parameters():
                 param.requires_grad = False
 
-        self.cnf_adapter = CNFAdapter(
+        self.cnf_adapter = CNFTextAdapter(
             hidden_size=self.hidden_size,
             prefix_tokens=self.config.prefix_tokens,
-            clause_hidden_dim=self.config.clause_hidden_dim,
             adapter_heads=self.config.adapter_heads,
-            adapter_layers=self.config.adapter_layers,
             dropout=self.config.dropout,
-            max_variables=self.config.max_variables,
-            max_clause_length=self.config.max_clause_length,
-            max_clause_count=self.config.max_clause_count,
         )
         self.dual_track = DualTrackBlock(
             hidden_size=self.hidden_size,
@@ -266,6 +162,10 @@ class LatentSATModel(nn.Module):
         return next(self.parameters()).device
 
     def cnf_to_text(self, clauses: Sequence[Sequence[int]]) -> str:
+        normalized = [[int(lit) for lit in clause] for clause in clauses]
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+    def cnf_to_readable_text(self, clauses: Sequence[Sequence[int]]) -> str:
         clause_strs = []
         for clause in clauses:
             lits = [f"~x{abs(lit)}" if lit < 0 else f"x{lit}" for lit in clause]
@@ -276,10 +176,12 @@ class LatentSATModel(nn.Module):
         self, clauses: Sequence[Sequence[int]], prompt: str | None = None
     ) -> str:
         task_prompt = prompt or "请判断该 CNF 是否可满足，并给出最终结论。"
-        formula_text = self.cnf_to_text(clauses)
+        formula_array_text = self.cnf_to_text(clauses)
+        formula_readable_text = self.cnf_to_readable_text(clauses)
         return (
             f"{DEFAULT_SYSTEM_PROMPT}\n\n"
-            f"CNF 公式:\n{formula_text}\n\n"
+            f"CNF 子句数组:\n{formula_array_text}\n\n"
+            f"CNF 可读形式:\n{formula_readable_text}\n\n"
             f"用户问题:\n{task_prompt}"
         )
 
@@ -298,6 +200,29 @@ class LatentSATModel(nn.Module):
 
     def _embed_tokens(self, token_ids: Tensor) -> Tensor:
         return self.llm.get_input_embeddings()(token_ids)
+
+    def _build_cnf_prefix(
+        self, batch_clauses: Sequence[Sequence[Sequence[int]]]
+    ) -> Tensor:
+        cnf_texts = [
+            f"CNF数组:{self.cnf_to_text(clauses)}"
+            for clauses in batch_clauses
+        ]
+        encoded = self.tokenizer(
+            cnf_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_prompt_length,
+            add_special_tokens=False,
+        )
+        cnf_input_ids = encoded.input_ids.to(self.device)
+        cnf_attention_mask = encoded.attention_mask.to(self.device)
+        cnf_embeds = self._embed_tokens(cnf_input_ids).to(dtype=self.model_dtype)
+        return self.cnf_adapter(cnf_embeds, cnf_attention_mask).to(
+            device=self.device,
+            dtype=self.model_dtype,
+        )
 
     def _build_attention_mask(
         self,
@@ -390,9 +315,7 @@ class LatentSATModel(nn.Module):
         if len(prompts) != len(batch_clauses):
             raise ValueError("prompts and batch_clauses must have the same batch size")
 
-        prefix = self.cnf_adapter(batch_clauses).to(
-            device=self.device, dtype=self.model_dtype
-        )
+        prefix = self._build_cnf_prefix(batch_clauses)
         prompt_input_ids, prompt_attention_mask = self._tokenize_prompts(prompts)
         prompt_embeds = self._embed_prompt(prompt_input_ids).to(dtype=self.model_dtype)
         final_prefix, reasoning_states = self._run_reasoning_loop(
