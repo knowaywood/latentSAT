@@ -12,3 +12,4 @@ wheels/
 /data
 /model
 /.try
+/checkpoints

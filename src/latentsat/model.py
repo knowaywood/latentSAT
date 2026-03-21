@@ -1,459 +1,462 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, Sequence
+from types import SimpleNamespace
+from typing import Sequence
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-DEFAULT_MODEL_PATH = "./model/Qwen3-0.6B"
-DEFAULT_SYSTEM_PROMPT = (
-    "你是一个逻辑推理助手。请结合给定的 CNF 前缀特征与文本提示进行分析，"
-    "输出清晰、严格的 SAT 推理结论。"
-)
-
-
-@dataclass
-class LatentSATOutput:
-    logits: Tensor
-    final_prefix: Tensor
-    reasoning_states: list[Tensor]
-    prompt_input_ids: Tensor
-    attention_mask: Tensor
 
 
 @dataclass
 class LatentSATConfig:
-    model_path: str = DEFAULT_MODEL_PATH
+    model_path: str = "latent-byte-transformer"
+    hidden_size: int = 256
+    intermediate_size: int = 1024
+    num_layers: int = 6
+    num_heads: int = 8
+    max_seq_len: int = 1024
+    max_literal_index: int = 256
     prefix_tokens: int = 32
-    num_reasoning_steps: int = 4
-    clause_hidden_dim: int = 256
-    adapter_heads: int = 8
-    adapter_layers: int = 2
-    dropout: float = 0.1
+    num_reasoning_steps: int = 8
+    stop_threshold: float = 0.5
     freeze_llm: bool = False
-    max_prompt_length: int = 512
-    max_variables: int = 512
-    max_clause_length: int = 16
-    max_clause_count: int = 512
+    layer_norm_eps: float = 1e-5
+    dropout: float = 0.0
+
+    def estimated_parameter_count(self) -> int:
+        d = self.hidden_size
+        ff = self.intermediate_size
+        n_layers = self.num_layers
+        core = self.max_seq_len * d
+        core += n_layers * (4 * d * d + 2 * d * ff)
+        core += 2 * self.max_literal_index * d
+        core += self.prefix_tokens * d
+        core += 8 * d * d
+        return core
 
 
-class ResidualMLP(nn.Module):
-    def __init__(self, hidden_size: int, dropout: float) -> None:
+class FeedForward(nn.Module):
+    def __init__(self, config: LatentSATConfig) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_size)
-        self.fc1 = nn.Linear(hidden_size, hidden_size * 4)
-        self.fc2 = nn.Linear(hidden_size * 4, hidden_size)
-        self.dropout = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(config.hidden_size, config.intermediate_size),
+            nn.GELU(),
+            nn.Linear(config.intermediate_size, config.hidden_size),
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        y = self.norm(x)
-        y = self.fc1(y)
-        y = F.gelu(y)
-        y = self.dropout(y)
-        y = self.fc2(y)
-        return self.dropout(y)
+        return self.net(x)
 
 
-class CNFTextAdapter(nn.Module):
-    """Compress CNF text embeddings into a fixed number of prefix tokens."""
+class TransformerBlock(nn.Module):
+    def __init__(self, config: LatentSATConfig) -> None:
+        super().__init__()
+        self.norm_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+        self.norm_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ffn = FeedForward(config)
 
-    def __init__(
+    def forward(self, x: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        seq_len = x.size(1)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+        )
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = attention_mask == 0
+        attn_out, _ = self.attn(
+            self.norm_1(x),
+            self.norm_1(x),
+            self.norm_1(x),
+            attn_mask=causal_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + attn_out
+        x = x + self.ffn(self.norm_2(x))
+        return x
+
+
+class LatentReasoner(nn.Module):
+    def __init__(self, config: LatentSATConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.position_embed = nn.Embedding(config.max_seq_len, config.hidden_size)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(config) for _ in range(config.num_layers)]
+        )
+        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(
         self,
-        hidden_size: int,
-        prefix_tokens: int,
-        adapter_heads: int,
-        dropout: float,
-    ) -> None:
+        x: Tensor,
+        attention_mask: Tensor | None = None,
+        return_dict: bool = True,
+        use_cache: bool = False,
+    ) -> SimpleNamespace | tuple[Tensor]:
+        del use_cache
+        seq_len = x.size(1)
+        if seq_len > self.config.max_seq_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_seq_len={self.config.max_seq_len}"
+            )
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        x = x + self.position_embed(positions)
+        for block in self.blocks:
+            x = block(x, attention_mask=attention_mask)
+        hidden_states = self.final_norm(x)
+        if return_dict:
+            return SimpleNamespace(hidden_states=hidden_states)
+        return (hidden_states,)
+
+
+class CNFAdapter(nn.Module):
+    def __init__(self, config: LatentSATConfig) -> None:
         super().__init__()
-        self.prefix_queries = nn.Parameter(torch.randn(prefix_tokens, hidden_size))
-        self.prefix_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=adapter_heads,
-            dropout=dropout,
+        self.config = config
+        self.var_embed = nn.Embedding(config.max_literal_index + 1, config.hidden_size)
+        self.sign_embed = nn.Embedding(2, config.hidden_size)
+        self.literal_proj = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+        )
+        self.clause_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.prefix_queries = nn.Parameter(
+            torch.randn(config.prefix_tokens, config.hidden_size) * 0.02
+        )
+        self.prefix_attn = nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_heads,
             batch_first=True,
         )
-        self.prefix_norm = nn.LayerNorm(hidden_size)
+        self.prefix_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, cnf_embeds: Tensor, cnf_attention_mask: Tensor) -> Tensor:
-        queries = self.prefix_queries.unsqueeze(0).expand(cnf_embeds.size(0), -1, -1)
-        prefix, _ = self.prefix_attention(
-            query=queries,
-            key=cnf_embeds,
-            value=cnf_embeds,
-            key_padding_mask=cnf_attention_mask == 0,
+    def forward(self, clauses_batch: Sequence[Sequence[Sequence[int]]]) -> Tensor:
+        device = self.prefix_queries.device
+        clause_embeddings: list[Tensor] = []
+        for clauses in clauses_batch:
+            if not clauses:
+                clause_embeddings.append(
+                    torch.zeros(1, self.config.hidden_size, device=device)
+                )
+                continue
+            encoded_clauses: list[Tensor] = []
+            for clause in clauses:
+                if not clause:
+                    encoded_clauses.append(
+                        torch.zeros(self.config.hidden_size, device=device)
+                    )
+                    continue
+                literals = torch.tensor(
+                    [min(abs(lit), self.config.max_literal_index) for lit in clause],
+                    device=device,
+                    dtype=torch.long,
+                )
+                signs = torch.tensor(
+                    [1 if lit > 0 else 0 for lit in clause],
+                    device=device,
+                    dtype=torch.long,
+                )
+                lit_repr = torch.cat(
+                    [self.var_embed(literals), self.sign_embed(signs)], dim=-1
+                )
+                clause_repr = self.literal_proj(lit_repr).mean(dim=0)
+                encoded_clauses.append(self.clause_norm(clause_repr))
+            clause_embeddings.append(torch.stack(encoded_clauses, dim=0))
+
+        max_clauses = max(item.size(0) for item in clause_embeddings)
+        padded = torch.zeros(
+            len(clause_embeddings),
+            max_clauses,
+            self.config.hidden_size,
+            device=device,
+        )
+        mask = torch.zeros(len(clause_embeddings), max_clauses, device=device)
+        for idx, item in enumerate(clause_embeddings):
+            padded[idx, : item.size(0)] = item
+            mask[idx, : item.size(0)] = 1
+
+        queries = self.prefix_queries.unsqueeze(0).expand(
+            len(clause_embeddings), -1, -1
+        )
+        refined, _ = self.prefix_attn(
+            queries,
+            padded,
+            padded,
+            key_padding_mask=mask == 0,
             need_weights=False,
         )
-        return self.prefix_norm(prefix + queries)
+        return self.prefix_norm(queries + refined)
 
 
-class DualTrackBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float) -> None:
+class DualTrackReasoner(nn.Module):
+    def __init__(self, config: LatentSATConfig) -> None:
         super().__init__()
-        self.prefix_norm = nn.LayerNorm(hidden_size)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
+            embed_dim=config.hidden_size,
+            num_heads=config.num_heads,
             batch_first=True,
         )
-        self.output_norm = nn.LayerNorm(hidden_size)
-        self.reasoning_ffn = ResidualMLP(hidden_size, dropout)
+        self.prefix_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.reason_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.reason_ffn = FeedForward(config)
+        self.stop_head = nn.Sequential(
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, 1),
+        )
+        nn.init.constant_(self.stop_head[-1].bias, -2.0)
 
-    def forward(self, prefix: Tensor, reasoning_trace: Tensor) -> tuple[Tensor, Tensor]:
-        normalized_prefix = self.prefix_norm(prefix)
+    def forward(
+        self, prefix: Tensor, z_t: Tensor, history: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
         refined_prefix, _ = self.cross_attn(
-            query=normalized_prefix,
-            key=reasoning_trace,
-            value=reasoning_trace,
+            prefix,
+            history,
+            history,
             need_weights=False,
         )
-        next_prefix = self.output_norm(prefix + refined_prefix)
-        latest_z = reasoning_trace[:, -1:, :]
-        next_reasoning = latest_z + self.reasoning_ffn(latest_z)
-        return next_prefix, next_reasoning
+        next_prefix = self.prefix_norm(prefix + refined_prefix)
+        next_reason = z_t + self.reason_ffn(self.reason_norm(z_t))
+        stop_logits = self.stop_head(z_t).squeeze(-1)
+        return next_prefix, next_reason, stop_logits
+
+
+@dataclass
+class LatentSATOutput:
+    sat_logits: Tensor
+    assignment_logits: Tensor
+    halt_logits: Tensor
+    halt_probs: Tensor
+    halt_steps: Tensor
+    decode_ready: Tensor
+    final_latent_states: Tensor
+    final_attention_mask: Tensor
+    reasoning_states: Tensor
+    structured_output: list[int] | None = None
 
 
 class LatentSATModel(nn.Module):
-    def __init__(self, config: LatentSATConfig | None = None) -> None:
+    def __init__(self, config: LatentSATConfig) -> None:
         super().__init__()
-        self.config = config or LatentSATConfig()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_path,
-            trust_remote_code=True,
+        self.config = config
+        self.cnf_adapter = CNFAdapter(config)
+        self.reasoner = LatentReasoner(config)
+        self.dual_track = DualTrackReasoner(config)
+        self.start_reason_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_size) * 0.02
         )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            self.config.model_path,
-            trust_remote_code=True,
-        )
-        self.hidden_size = int(self.llm.config.hidden_size)
-        self.model_dtype = next(self.llm.parameters()).dtype
-        if not torch.cuda.is_available():
-            self.llm = self.llm.float()
-            self.model_dtype = torch.float32
-
-        if self.config.freeze_llm:
-            for param in self.llm.parameters():
+        self.sat_head = nn.Linear(config.hidden_size, 1)
+        self.assignment_head = nn.Linear(config.hidden_size, config.max_literal_index)
+        self.model_dtype = self.start_reason_token.dtype
+        if config.freeze_llm:
+            for param in self.reasoner.parameters():
                 param.requires_grad = False
 
-        self.cnf_adapter = CNFTextAdapter(
-            hidden_size=self.hidden_size,
-            prefix_tokens=self.config.prefix_tokens,
-            adapter_heads=self.config.adapter_heads,
-            dropout=self.config.dropout,
-        )
-        self.dual_track = DualTrackBlock(
-            hidden_size=self.hidden_size,
-            num_heads=self.config.adapter_heads,
-            dropout=self.config.dropout,
-        )
-        self.cnf_adapter = self.cnf_adapter.to(dtype=self.model_dtype)
-        self.dual_track = self.dual_track.to(dtype=self.model_dtype)
+        if config.estimated_parameter_count() >= 50_000_000:
+            raise ValueError("Model exceeds the requested 50M parameter budget")
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
+    def _validate_clauses(self, clauses: Sequence[Sequence[int]]) -> list[list[int]]:
+        if not isinstance(clauses, Sequence):
+            raise TypeError("clauses must be a list[list[int]]")
 
-    def cnf_to_text(self, clauses: Sequence[Sequence[int]]) -> str:
-        normalized = [[int(lit) for lit in clause] for clause in clauses]
-        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-
-    def cnf_to_readable_text(self, clauses: Sequence[Sequence[int]]) -> str:
-        clause_strs = []
+        normalized: list[list[int]] = []
         for clause in clauses:
-            lits = [f"~x{abs(lit)}" if lit < 0 else f"x{lit}" for lit in clause]
-            clause_strs.append("(" + " | ".join(lits) + ")")
-        return " & ".join(clause_strs) if clause_strs else "EMPTY"
+            if not isinstance(clause, Sequence) or isinstance(clause, (str, bytes)):
+                raise TypeError("clauses must be a list[list[int]]")
+            normalized_clause: list[int] = []
+            for lit in clause:
+                if not isinstance(lit, int):
+                    raise TypeError("each literal in clauses must be int")
+                normalized_clause.append(int(lit))
+            normalized.append(normalized_clause)
+        return normalized
 
-    def build_prompt(
-        self, clauses: Sequence[Sequence[int]], prompt: str | None = None
-    ) -> str:
-        task_prompt = prompt or "请判断该 CNF 是否可满足，并给出最终结论。"
-        formula_array_text = self.cnf_to_text(clauses)
-        formula_readable_text = self.cnf_to_readable_text(clauses)
-        return (
-            f"{DEFAULT_SYSTEM_PROMPT}\n\n"
-            f"CNF 子句数组:\n{formula_array_text}\n\n"
-            f"CNF 可读形式:\n{formula_readable_text}\n\n"
-            f"用户问题:\n{task_prompt}"
+    def _run_reasoning(
+        self, clauses_batch: Sequence[Sequence[Sequence[int]]]
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        device = next(self.parameters()).device
+        prefix = self.cnf_adapter(clauses_batch).to(dtype=self.model_dtype)
+        batch_size = prefix.size(0)
+        start_reason = self.start_reason_token.expand(batch_size, -1, -1).to(
+            dtype=self.model_dtype
         )
 
-    def _tokenize_prompts(self, prompts: Sequence[str]) -> tuple[Tensor, Tensor]:
-        encoded = self.tokenizer(
-            list(prompts),
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_prompt_length,
+        history_states: list[Tensor] = []
+        halt_logits: list[Tensor] = []
+        current_reason_state = start_reason
+        halt_steps = torch.full(
+            (batch_size,),
+            fill_value=self.config.num_reasoning_steps,
+            dtype=torch.long,
+            device=device,
         )
-        return encoded.input_ids.to(self.device), encoded.attention_mask.to(self.device)
+        halted = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    def _embed_prompt(self, prompt_input_ids: Tensor) -> Tensor:
-        return self.llm.get_input_embeddings()(prompt_input_ids)
-
-    def _embed_tokens(self, token_ids: Tensor) -> Tensor:
-        return self.llm.get_input_embeddings()(token_ids)
-
-    def _build_cnf_prefix(
-        self, batch_clauses: Sequence[Sequence[Sequence[int]]]
-    ) -> Tensor:
-        cnf_texts = [
-            f"CNF数组:{self.cnf_to_text(clauses)}"
-            for clauses in batch_clauses
-        ]
-        encoded = self.tokenizer(
-            cnf_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_prompt_length,
-            add_special_tokens=False,
-        )
-        cnf_input_ids = encoded.input_ids.to(self.device)
-        cnf_attention_mask = encoded.attention_mask.to(self.device)
-        cnf_embeds = self._embed_tokens(cnf_input_ids).to(dtype=self.model_dtype)
-        return self.cnf_adapter(cnf_embeds, cnf_attention_mask).to(
-            device=self.device,
-            dtype=self.model_dtype,
-        )
-
-    def _build_attention_mask(
-        self,
-        batch_size: int,
-        prefix_len: int,
-        prompt_attention_mask: Tensor,
-        reasoning_len: int,
-        generated_len: int = 0,
-    ) -> Tensor:
-        prefix_mask = torch.ones(
-            batch_size,
-            prefix_len,
-            dtype=prompt_attention_mask.dtype,
-            device=self.device,
-        )
-        reasoning_mask = torch.ones(
-            batch_size,
-            reasoning_len,
-            dtype=prompt_attention_mask.dtype,
-            device=self.device,
-        )
-        generated_mask = torch.ones(
-            batch_size,
-            generated_len,
-            dtype=prompt_attention_mask.dtype,
-            device=self.device,
-        )
-        return torch.cat(
-            [prefix_mask, prompt_attention_mask, reasoning_mask, generated_mask],
-            dim=1,
-        )
-
-    def _run_reasoning_loop(
-        self,
-        prefix: Tensor,
-        prompt_embeds: Tensor,
-        prompt_attention_mask: Tensor,
-    ) -> tuple[Tensor, list[Tensor]]:
-        reasoning_states: list[Tensor] = []
-        latent_trace: list[Tensor] = []
-        current_prefix = prefix
-
-        for _ in range(self.config.num_reasoning_steps):
-            if reasoning_states:
-                reasoning_tensor = torch.cat(reasoning_states, dim=1)
-            else:
-                reasoning_tensor = torch.empty(
-                    prefix.size(0),
-                    0,
-                    self.hidden_size,
-                    device=self.device,
-                    dtype=prefix.dtype,
-                )
-
-            llm_inputs = [current_prefix, prompt_embeds]
-            if reasoning_tensor.size(1) > 0:
-                llm_inputs.append(reasoning_tensor)
-            inputs_embeds = torch.cat(llm_inputs, dim=1)
-            attention_mask = self._build_attention_mask(
-                batch_size=prefix.size(0),
-                prefix_len=current_prefix.size(1),
-                prompt_attention_mask=prompt_attention_mask,
-                reasoning_len=reasoning_tensor.size(1),
+        for step in range(self.config.num_reasoning_steps):
+            reasoning_context = (
+                torch.cat(history_states, dim=1) if history_states else current_reason_state
             )
-            outputs = self.llm(
-                inputs_embeds=inputs_embeds,
+            llm_input = torch.cat([prefix, reasoning_context], dim=1)
+            attention_mask = torch.ones(
+                llm_input.size(0), llm_input.size(1), dtype=torch.long, device=device
+            )
+            llm_out = self.reasoner(
+                x=llm_input,
                 attention_mask=attention_mask,
-                output_hidden_states=True,
                 return_dict=True,
                 use_cache=False,
             )
-            z_t = outputs.hidden_states[-1][:, -1:, :]
-            latent_trace.append(z_t)
-            z_history = torch.cat(latent_trace, dim=1)
-            current_prefix, h_next = self.dual_track(current_prefix, z_history)
-            reasoning_states.append(h_next)
+            z_t = llm_out.hidden_states[:, -1:, :]
+            next_prefix, next_reason, stop_logit = self.dual_track(
+                prefix=prefix,
+                z_t=z_t,
+                history=torch.cat([reasoning_context, z_t], dim=1),
+            )
 
-        return current_prefix, reasoning_states
+            current_halt = (
+                torch.sigmoid(stop_logit.squeeze(-1)) >= self.config.stop_threshold
+            )
+            new_halt = current_halt & (~halted)
+            halt_steps = torch.where(
+                new_halt,
+                torch.full_like(halt_steps, step + 1),
+                halt_steps,
+            )
+            active_mask = (~halted).view(batch_size, 1, 1)
+            prefix = torch.where(active_mask, next_prefix, prefix)
+            current_reason_state = torch.where(
+                active_mask,
+                next_reason,
+                current_reason_state,
+            )
+            history_states.append(current_reason_state)
+            halt_logits.append(stop_logit)
+            halted = halted | current_halt
+
+        reasoning_states = torch.cat(history_states, dim=1)
+        halt_logits_tensor = torch.cat(halt_logits, dim=1)
+        halt_probs = torch.sigmoid(halt_logits_tensor)
+        return prefix, reasoning_states, halt_logits_tensor, halt_probs, halt_steps
 
     def _compose_final_inputs(
         self,
-        batch_clauses: Sequence[Sequence[Sequence[int]]],
-        prompts: Sequence[str] | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, list[Tensor]]:
-        if not batch_clauses:
-            raise ValueError("batch_clauses cannot be empty")
-
-        if prompts is None:
-            prompts = [self.build_prompt(clauses) for clauses in batch_clauses]
-        if len(prompts) != len(batch_clauses):
-            raise ValueError("prompts and batch_clauses must have the same batch size")
-
-        prefix = self._build_cnf_prefix(batch_clauses)
-        prompt_input_ids, prompt_attention_mask = self._tokenize_prompts(prompts)
-        prompt_embeds = self._embed_prompt(prompt_input_ids).to(dtype=self.model_dtype)
-        final_prefix, reasoning_states = self._run_reasoning_loop(
-            prefix=prefix,
-            prompt_embeds=prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
+        clauses_batch: Sequence[Sequence[Sequence[int]]],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        prefix, reasoning_states, halt_logits, halt_probs, halt_steps = (
+            self._run_reasoning(clauses_batch=clauses_batch)
         )
-
-        reasoning_tensor = None
-        reasoning_len = 0
-        if reasoning_states:
-            reasoning_tensor = torch.cat(reasoning_states, dim=1)
-            reasoning_len = reasoning_tensor.size(1)
-
-        pieces = [final_prefix, prompt_embeds]
-        if reasoning_tensor is not None:
-            pieces.append(reasoning_tensor)
-        final_inputs = torch.cat(pieces, dim=1)
-        final_attention_mask = self._build_attention_mask(
-            batch_size=final_prefix.size(0),
-            prefix_len=final_prefix.size(1),
-            prompt_attention_mask=prompt_attention_mask,
-            reasoning_len=reasoning_len,
+        final_inputs = torch.cat([prefix, reasoning_states], dim=1)
+        final_attention_mask = torch.ones(
+            prefix.size(0),
+            prefix.size(1) + reasoning_states.size(1),
+            dtype=torch.long,
+            device=prefix.device,
         )
         return (
-            final_inputs,
+            final_inputs.to(dtype=self.model_dtype),
             final_attention_mask,
-            final_prefix,
-            prompt_input_ids,
             reasoning_states,
+            halt_probs,
+            halt_steps,
         )
 
     def forward(
         self,
-        batch_clauses: Sequence[Sequence[Sequence[int]]],
-        prompts: Sequence[str] | None = None,
+        clauses_batch: Sequence[Sequence[int]],
     ) -> LatentSATOutput:
+        normalized_clauses = self._validate_clauses(clauses_batch)
+        normalized_clauses_batch = [normalized_clauses]
         (
             final_inputs,
             final_attention_mask,
-            final_prefix,
-            prompt_input_ids,
             reasoning_states,
-        ) = self._compose_final_inputs(batch_clauses, prompts)
-        final_outputs = self.llm(
-            inputs_embeds=final_inputs,
-            attention_mask=final_attention_mask,
-            return_dict=True,
-            use_cache=False,
+            halt_probs,
+            halt_steps,
+        ) = self._compose_final_inputs(normalized_clauses_batch)
+
+        last_reason = reasoning_states[:, -1, :]
+        sat_logits = self.sat_head(last_reason)
+        assignment_logits = self.assignment_head(last_reason)
+        halt_logits = torch.logit(halt_probs.clamp(1e-6, 1 - 1e-6))
+        num_vars = max(
+            (
+                abs(lit)
+                for clauses in normalized_clauses_batch
+                for clause in clauses
+                for lit in clause
+            ),
+            default=0,
         )
+        raw_structured_output = self.decode_solution(
+            sat_logits=sat_logits,
+            assignment_logits=assignment_logits,
+            num_vars=num_vars,
+        )
+        decode_ready = (halt_probs >= self.config.stop_threshold).any(dim=1)
+        structured_output = (
+            raw_structured_output[0] if bool(decode_ready[0].item()) else None
+        )
+
         return LatentSATOutput(
-            logits=final_outputs.logits,
-            final_prefix=final_prefix,
+            sat_logits=sat_logits,
+            assignment_logits=assignment_logits,
+            halt_logits=halt_logits,
+            halt_probs=halt_probs,
+            halt_steps=halt_steps,
+            decode_ready=decode_ready,
+            final_latent_states=final_inputs,
+            final_attention_mask=final_attention_mask,
             reasoning_states=reasoning_states,
-            prompt_input_ids=prompt_input_ids,
-            attention_mask=final_attention_mask,
+            structured_output=structured_output,
         )
 
-    @torch.no_grad()
-    def generate(
-        self,
-        batch_clauses: Sequence[Sequence[Sequence[int]]],
-        prompts: Sequence[str] | None = None,
-        max_new_tokens: int = 128,
-        temperature: float = 0.8,
-        do_sample: bool = True,
-        **_: Any,
-    ) -> list[str]:
-        (
-            final_inputs,
-            final_attention_mask,
-            _,
-            _,
-            _,
-        ) = self._compose_final_inputs(batch_clauses, prompts)
-
-        batch_size = final_inputs.size(0)
-        generated_ids = torch.empty(batch_size, 0, dtype=torch.long, device=self.device)
-        current_embeds = final_inputs
-        current_mask = final_attention_mask
-
-        for _ in range(max_new_tokens):
-            outputs = self.llm(
-                inputs_embeds=current_embeds,
-                attention_mask=current_mask,
-                return_dict=True,
-                use_cache=False,
-            )
-            next_logits = outputs.logits[:, -1, :]
-            if do_sample:
-                next_logits = next_logits / max(temperature, 1e-5)
-                probs = torch.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
-
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)
-            next_embeds = self._embed_tokens(next_token)
-            current_embeds = torch.cat([current_embeds, next_embeds], dim=1)
-            current_mask = self._build_attention_mask(
-                batch_size=batch_size,
-                prefix_len=0,
-                prompt_attention_mask=current_mask,
-                reasoning_len=0,
-                generated_len=1,
-            )
-
-            if self.tokenizer.eos_token_id is not None:
-                if bool(
-                    torch.all(next_token.squeeze(-1) == self.tokenizer.eos_token_id)
-                ):
-                    break
-
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    def decode_solution(
+        self, sat_logits: Tensor, assignment_logits: Tensor, num_vars: int
+    ) -> list[list[int]]:
+        sat_values = (torch.sigmoid(sat_logits.squeeze(-1)) >= 0.5).to(torch.int64)
+        assignment_values = (torch.sigmoid(assignment_logits[:, :num_vars]) >= 0.5).to(
+            torch.int64
+        )
+        outputs: list[list[int]] = []
+        for sat, assignment in zip(sat_values.tolist(), assignment_values.tolist()):
+            outputs.append([int(sat), *[int(v) for v in assignment]])
+        return outputs
 
 
 def build_model(config: LatentSATConfig | None = None) -> LatentSATModel:
-    return LatentSATModel(config=config)
+    if config is None:
+        config = LatentSATConfig()
+    return LatentSATModel(config)
 
 
 if __name__ == "__main__":
-    demo_clauses = [[[1, -2], [2, 3], [-1, -3]]]
-    demo_prompts = ["请判断这个 CNF 是否可满足，并简要说明结论。"]
-
     model = build_model()
-    model.eval()
+    demo_clauses = [
+        [-5, 3, 2],
+        [-4, 1, -2],
+        [-4, -3, -2],
+        [-2, -1, -4],
+        [3, 4, -1],
+        [-5, 4, 2],
+        [-2, 5, 3],
+        [1, -5, -2],
+        [-1, 4, -5],
+        [-3, -1, -5],
+    ]
+    outputs = model(demo_clauses)
 
-    with torch.no_grad():
-        outputs = model(demo_clauses, prompts=demo_prompts)
-        generated_texts = model.generate(
-            demo_clauses,
-            prompts=demo_prompts,
-            max_new_tokens=64,
-            do_sample=False,
-        )
-
-    print("logits shape:", tuple(outputs.logits.shape))
-    print("final prefix shape:", tuple(outputs.final_prefix.shape))
-    print("reasoning steps:", len(outputs.reasoning_states))
-    print("generated text:")
-    print(generated_texts[0])
+    print("sat_logits shape:", tuple(outputs.sat_logits.shape))
+    print("assignment_logits shape:", tuple(outputs.assignment_logits.shape))
+    print("halt_probs shape:", tuple(outputs.halt_probs.shape))
+    print("halt_steps:", outputs.halt_steps.tolist())
+    print("decode_ready:", outputs.decode_ready.tolist())
+    print("structured_output:", outputs.structured_output)

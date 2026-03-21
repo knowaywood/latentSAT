@@ -105,7 +105,7 @@ def generate_dataset(
 if __name__ == "__main__":
     generate_dataset(
         output_path="data/list_data.jsonl",
-        total=1000,
+        total=10,
         configs=None,
         seed=42,
         sat_ratio=0.7,
