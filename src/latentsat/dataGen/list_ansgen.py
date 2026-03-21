@@ -1,8 +1,9 @@
 import json
 import os
 import random
+from collections import OrderedDict
 
-from latentsat.dataGen.genCoT import generate_cnf, generate_unsat_cnf
+from latentsat.dataGen.genCoT import generate_cnf, generate_unsat_cnf, solve_cnf
 
 
 def build_sample(
@@ -17,9 +18,11 @@ def build_sample(
     is_sat, assignment, _ = solve_cnf(clauses, num_vars)
 
     if is_sat:
-        answer = f"Assignment: {assignment}"
+        assignment[0] = True
+        assignment = OrderedDict(sorted(assignment.items()))
+        answer = [int(assignment[i]) for i in assignment.keys()]
     else:
-        answer = "UNSAT"
+        answer = [int(False)]
 
     return {
         "num_vars": num_vars,
@@ -101,8 +104,8 @@ def generate_dataset(
 
 if __name__ == "__main__":
     generate_dataset(
-        output_path="data/clean_data.jsonl",
-        total=10,
+        output_path="data/list_data.jsonl",
+        total=1000,
         configs=None,
         seed=42,
         sat_ratio=0.7,

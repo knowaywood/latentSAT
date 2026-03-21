@@ -1,40 +1,89 @@
 import ast
 
 
-def is_SAT(text: str) -> bool:
-    if "UNSAT" in text:
-        return False
-    else:
-        return True
-
-
-def extract_conclusion(text: str) -> dict[int, bool]:
-    if is_SAT(text):
-        text = text.split("Assignment:", 1)[-1].strip()
-        return ast.literal_eval(text)
-    else:
-        return {}
-
-
-def verify(
-    clauses: list[list[int]], assignment: dict[int, bool], satisfiable: bool
-) -> bool:
-    if assignment == {} and satisfiable:
-        return False
-    if assignment == {} and not satisfiable:
-        return True
-    if assignment != {} and not satisfiable:
-        return False
-    for clause in clauses:
-        vec = []
-        for j in clause:
-            if j < 0:
-                vec.append(int(not assignment[-j]))
-            else:
-                vec.append(int(assignment[j]))
-        if sum(vec) == 0:
+class VerifyText:
+    def _is_sat(self, text: str) -> bool:
+        if "UNSAT" in text:
             return False
-    return True
+        else:
+            return True
+
+    def extract_conclusion(self, text: str) -> dict[int, bool]:
+        if self._is_sat(text):
+            text = text.split("Assignment:", 1)[-1].strip()
+            return ast.literal_eval(text)
+        else:
+            return {}
+
+    def verify(
+        self, clauses: list[list[int]], assignment: dict[int, bool], satisfiable: bool
+    ) -> bool:
+        if assignment == {} and satisfiable:
+            return False
+        if assignment == {} and not satisfiable:
+            return True
+        if assignment != {} and not satisfiable:
+            return False
+        for clause in clauses:
+            vec = []
+            for j in clause:
+                if j < 0:
+                    vec.append(int(not assignment[-j]))
+                else:
+                    vec.append(int(assignment[j]))
+            if sum(vec) == 0:
+                return False
+        return True
+
+    def __call__(
+        self, clauses: list[list[int]], assignment: dict[int, bool], satisfiable: bool
+    ) -> bool:
+        return self.verify(clauses, assignment, satisfiable)
+
+
+class VerifyList:
+    def _is_sat(self, list: list[int]) -> bool:
+        if list[0] == 0:
+            return False
+        elif list[0] == 1:
+            return True
+        else:
+            assert Exception("invalid list")
+
+    def verify(
+        self, clauses: list[list[int]], assignment: list[int], satisfiable: bool
+    ) -> bool:
+        if assignment == [0] and satisfiable:
+            return False
+        if assignment == [0] and not satisfiable:
+            return True
+        if assignment != [0] and not satisfiable:
+            return False
+        if assignment != [0] and not satisfiable:
+            assert Exception("invalid list")
+        for clause in clauses:
+            vec = []
+            for j in clause:
+                if j < 0:
+                    vec.append(self._not(assignment[-j]))
+                else:
+                    vec.append(assignment[j])
+            if sum(vec) == 0:
+                return False
+        return True
+
+    def _not(self, a: int):
+        if a == 0:
+            return 1
+        elif a == 1:
+            return 0
+        else:
+            assert Exception("invalid int")
+
+    def __call__(
+        self, clauses: list[list[int]], assignment: list[int], satisfiable: bool
+    ) -> bool:
+        return self.verify(clauses, assignment, satisfiable)
 
 
 if __name__ == "__main__":
@@ -51,4 +100,3 @@ if __name__ == "__main__":
         [-1, 4, -5],
         [-3, -1, -5],
     ]
-    print(verify(clauses, extract_conclusion(text), True))
