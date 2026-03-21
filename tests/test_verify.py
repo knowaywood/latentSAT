@@ -19,8 +19,10 @@ def test_verify_text(data):
         satisfiable = i["satisfiable"]
         clauses = i["clauses"]
         answer = i["answer"]
+        num_vars = i["num_vars"]
+
         assignment = verify.extract_conclusion(answer)
-        assert verify(clauses, assignment, satisfiable)
+        assert verify(clauses, num_vars,assignment, satisfiable)
 
 
 @pytest.fixture
@@ -34,7 +36,8 @@ def list_data():
 def test_verify_list(list_data):
     verify = VerifyList()
     for i in list_data:
+        num_vars = i["num_vars"]
         satisfiable = i["satisfiable"]
         clauses = i["clauses"]
         answer = i["answer"]
-        assert verify(clauses, answer, satisfiable)
+        assert verify(clauses, num_vars, answer, satisfiable)

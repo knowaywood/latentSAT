@@ -16,9 +16,13 @@ class VerifyText:
             return {}
 
     def verify(
-        self, clauses: list[list[int]], assignment: dict[int, bool], satisfiable: bool
+        self,
+        clauses: list[list[int]],
+        num_vars: int,
+        assignment: dict[int, bool],
+        satisfiable: bool,
     ) -> bool:
-        if assignment == {} and satisfiable:
+        if len(assignment) != num_vars and satisfiable:
             return False
         if assignment == {} and not satisfiable:
             return True
@@ -36,9 +40,13 @@ class VerifyText:
         return True
 
     def __call__(
-        self, clauses: list[list[int]], assignment: dict[int, bool], satisfiable: bool
+        self,
+        clauses: list[list[int]],
+        num_vars: int,
+        assignment: dict[int, bool],
+        satisfiable: bool,
     ) -> bool:
-        return self.verify(clauses, assignment, satisfiable)
+        return self.verify(clauses, num_vars, assignment, satisfiable)
 
 
 class VerifyList:
@@ -51,16 +59,18 @@ class VerifyList:
             assert Exception("invalid list")
 
     def verify(
-        self, clauses: list[list[int]], assignment: list[int], satisfiable: bool
+        self,
+        clauses: list[list[int]],
+        num_vars: int,
+        assignment: list[int],
+        satisfiable: bool,
     ) -> bool:
-        if assignment == [0] and satisfiable:
-            return False
         if assignment == [0] and not satisfiable:
             return True
         if assignment != [0] and not satisfiable:
             return False
-        if assignment != [0] and not satisfiable:
-            assert Exception("invalid list")
+        if num_vars + 1 != len(assignment) and satisfiable:
+            return False
         for clause in clauses:
             vec = []
             for j in clause:
@@ -81,9 +91,13 @@ class VerifyList:
             assert Exception("invalid int")
 
     def __call__(
-        self, clauses: list[list[int]], assignment: list[int], satisfiable: bool
+        self,
+        clauses: list[list[int]],
+        num_vars: int,
+        assignment: list[int],
+        satisfiable: bool,
     ) -> bool:
-        return self.verify(clauses, assignment, satisfiable)
+        return self.verify(clauses, num_vars, assignment, satisfiable)
 
 
 if __name__ == "__main__":
