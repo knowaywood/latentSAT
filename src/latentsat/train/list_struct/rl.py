@@ -13,6 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
 
 from latentsat.model import LatentSATConfig, LatentSATModel, build_model
+from latentsat.utils.verify import VerifyList
 
 
 @dataclass
@@ -84,6 +85,9 @@ class RLTrainer:
         weight_decay: float,
         grad_clip: float,
         save_dir: str | Path,
+        epsilon_start: float,
+        epsilon_end: float,
+        epsilon_decay_steps: int,
         device: str | None = None,
     ) -> None:
         self.model = model
@@ -100,36 +104,84 @@ class RLTrainer:
             weight_decay=weight_decay,
         )
         self.baseline = RunningMeanBaseline()
+        self.verify = VerifyList()
+        self.epsilon_start = float(epsilon_start)
+        self.epsilon_end = float(epsilon_end)
+        self.epsilon_decay_steps = max(1, int(epsilon_decay_steps))
+        self.global_step = 0
+
+    def _num_vars_from_clauses(self, clauses: Sequence[Sequence[int]]) -> int:
+        return max((abs(lit) for clause in clauses for lit in clause), default=0)
+
+    def _current_epsilon(self) -> float:
+        progress = min(1.0, self.global_step / self.epsilon_decay_steps)
+        return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress
 
     def _sample_policy(
         self, sample: ListSample
-    ) -> tuple[Tensor, Tensor, list[int], float, int]:
+    ) -> tuple[Tensor, Tensor, list[int], float, int, bool]:
         output = self.model(sample.clauses)
+        epsilon = self._current_epsilon()
+        explore = random.random() < epsilon
 
         sat_dist = torch.distributions.Bernoulli(logits=output.sat_logits[0])
-        sat_action = sat_dist.sample()
+        if explore:
+            sat_action = torch.randint(
+                0,
+                2,
+                sat_dist.logits.shape,
+                device=self.device,
+                dtype=sat_dist.logits.dtype,
+            )
+        else:
+            sat_action = sat_dist.sample()
         sat_log_prob = sat_dist.log_prob(sat_action).sum()
 
-        num_vars = max(len(sample.answer) - 1, 0)
+        num_vars = self._num_vars_from_clauses(sample.clauses)
         assignment_log_prob = torch.zeros((), device=self.device)
         assignment_bits: list[int] = []
         if num_vars > 0:
             assign_logits = output.assignment_logits[0, :num_vars]
             assign_dist = torch.distributions.Bernoulli(logits=assign_logits)
-            assign_action = assign_dist.sample()
+            if explore:
+                assign_action = torch.randint(
+                    0,
+                    2,
+                    assign_logits.shape,
+                    device=self.device,
+                    dtype=assign_logits.dtype,
+                )
+            else:
+                assign_action = assign_dist.sample()
             assignment_log_prob = assign_dist.log_prob(assign_action).sum()
             assignment_bits = [int(x) for x in assign_action.tolist()]
 
         sampled_output = [int(sat_action.item()), *assignment_bits]
-        reward = 1.0 if sampled_output == sample.answer else -0.2
-        if sampled_output and sampled_output[0] == sample.answer[0]:
+        verify_ok = self.verify(
+            sample.clauses, num_vars, sampled_output, sample.satisfiable
+        )
+        sat_ok = self.verify.verify_sat(sampled_output, sample.satisfiable)
+        len_ok = self.verify.verify_len_err(
+            num_vars, sampled_output, sample.satisfiable
+        )
+        reward = 1.0 if verify_ok else -0.5
+        if (not verify_ok) and sat_ok:
             reward += 0.2
+        if not len_ok:
+            reward -= 0.2
 
         stop_prob = output.halt_probs.max(dim=1).values[0]
         stop_bonus = 0.1 * float(stop_prob.item())
         reward += stop_bonus
         log_prob = sat_log_prob + assignment_log_prob
-        return log_prob, stop_prob, sampled_output, reward, int(output.halt_steps[0].item())
+        return (
+            log_prob,
+            stop_prob,
+            sampled_output,
+            reward,
+            int(output.halt_steps[0].item()),
+            explore,
+        )
 
     def train_epoch(
         self, dataloader: DataLoader[list[ListSample]], epoch: int, log_every: int
@@ -141,16 +193,24 @@ class RLTrainer:
             stop_probs: list[Tensor] = []
             samples_out: list[list[int]] = []
             halt_steps: list[int] = []
+            explore_count = 0
 
             for sample in batch:
-                log_prob, stop_prob, sampled_output, reward, halt_step = self._sample_policy(sample)
+                self.global_step += 1
+                log_prob, stop_prob, sampled_output, reward, halt_step, explored = (
+                    self._sample_policy(sample)
+                )
                 log_probs.append(log_prob)
                 rewards_list.append(reward)
                 stop_probs.append(stop_prob)
                 samples_out.append(sampled_output)
                 halt_steps.append(halt_step)
+                if explored:
+                    explore_count += 1
 
-            rewards = torch.tensor(rewards_list, dtype=torch.float32, device=self.device)
+            rewards = torch.tensor(
+                rewards_list, dtype=torch.float32, device=self.device
+            )
             baseline = self.baseline.update(rewards)
             advantages = rewards - baseline
             log_prob_tensor = torch.stack(log_probs)
@@ -168,10 +228,14 @@ class RLTrainer:
             if step % log_every == 0 or step == 1:
                 print(
                     f"epoch={epoch} step={step} loss={loss.item():.4f} "
-                    f"reward={rewards.mean().item():.4f} halt={sum(halt_steps) / len(halt_steps):.2f}"
+                    f"reward={rewards.mean().item():.4f} halt={sum(halt_steps) / len(halt_steps):.2f} "
+                    f"eps={self._current_epsilon():.4f} explore={explore_count}/{len(batch)}"
                 )
+                sample_num_vars = self._num_vars_from_clauses(batch[0].clauses)
                 print(
-                    f"sample_pred={samples_out[0]} sample_target={batch[0].answer}"
+                    f"sample_pred={samples_out[0]} "
+                    f"verify={self.verify(batch[0].clauses, sample_num_vars, samples_out[0], batch[0].satisfiable)} "
+                    f"target_sat={int(batch[0].satisfiable)}"
                 )
 
     def save_checkpoint(self, name: str) -> None:
@@ -204,18 +268,21 @@ def load_pretrained_model(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RL fine-tuning for LatentSAT")
-    parser.add_argument("--train-file", type=str, default="data/list_data.jsonl")
+    parser.add_argument("--train-file", type=str, default="data/list_data_rl.jsonl")
     parser.add_argument(
         "--pretrained-dir",
         type=str,
-        default="checkpoints/list_struct/pretrain/epoch_1",
+        default="checkpoints/list_struct/pretrain/epoch_4",
     )
     parser.add_argument("--save-dir", type=str, default="checkpoints/list_struct/rl")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--epsilon-start", type=float, default=0.30)
+    parser.add_argument("--epsilon-end", type=float, default=0.05)
+    parser.add_argument("--epsilon-decay-steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
@@ -241,6 +308,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         save_dir=args.save_dir,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
+        epsilon_decay_steps=args.epsilon_decay_steps,
         device=args.device,
     )
 
