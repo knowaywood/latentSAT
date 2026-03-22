@@ -58,6 +58,29 @@ class VerifyList:
         else:
             assert Exception("invalid list")
 
+    def verify_sat(
+        self,
+        assignment: list[int],
+        satisfiable: bool,
+    ):
+        if satisfiable and assignment[0] == 1:
+            return True
+        elif satisfiable and assignment[0] == 0:
+            return False
+        elif not satisfiable and assignment[0] == 1:
+            return False
+        elif not satisfiable and assignment[0] == 0:
+            return True
+        else:
+            return False
+
+    def verify_len_err(self, num_vars: int, assignment: list[int], satisfiable: bool):
+        if satisfiable and num_vars + 1 != len(assignment):
+            return False
+        if not satisfiable and 1 != len(assignment):
+            return False
+        return True
+
     def verify(
         self,
         clauses: list[list[int]],
@@ -65,11 +88,11 @@ class VerifyList:
         assignment: list[int],
         satisfiable: bool,
     ) -> bool:
-        if assignment == [0] and not satisfiable:
+        if assignment[0] == 0 and not satisfiable:
             return True
-        if assignment != [0] and not satisfiable:
+        if assignment[0] != 0 and not satisfiable:
             return False
-        if num_vars + 1 != len(assignment) and satisfiable:
+        if num_vars + 1 > len(assignment) and satisfiable:
             return False
         for clause in clauses:
             vec = []
