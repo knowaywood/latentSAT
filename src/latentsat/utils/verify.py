@@ -95,13 +95,10 @@ class VerifyList:
         if num_vars + 1 > len(assignment) and satisfiable:
             return False
         for clause in clauses:
-            vec = []
-            for j in clause:
-                if j < 0:
-                    vec.append(self._not(assignment[-j]))
-                else:
-                    vec.append(assignment[j])
-            if sum(vec) == 0:
+            is_clause_sat = any(
+                self._not(assignment[-j]) if j < 0 else assignment[j] for j in clause
+            )
+            if not is_clause_sat:
                 return False
         return True
 
